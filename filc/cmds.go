@@ -37,12 +37,12 @@ import (
 	"github.com/ipld/go-ipld-prime/traversal/selector"
 	"github.com/ipld/go-ipld-prime/traversal/selector/builder"
 	textselector "github.com/ipld/go-ipld-selector-text-lite"
-	"github.com/libp2p/go-libp2p-core/host"
-	inet "github.com/libp2p/go-libp2p-core/network"
-	"github.com/libp2p/go-libp2p-core/peer"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/host"
+	inet "github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
-	cli "github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
 )
 
@@ -124,6 +124,7 @@ var makeDealCmd = &cli.Command{
 		}
 
 		verified := parseVerified(cctx)
+		removeUnsealed := parseRemoveUnsealed(cctx)
 
 		price := ask.Ask.Ask.Price
 		if verified {
@@ -134,7 +135,7 @@ var makeDealCmd = &cli.Command{
 		}
 
 		minPieceSize := ask.Ask.Ask.MinPieceSize
-		proposal, err := fc.MakeDeal(cctx.Context, miner, obj.Cid(), price, minPieceSize, 2880*365, verified)
+		proposal, err := fc.MakeDeal(cctx.Context, miner, obj.Cid(), price, minPieceSize, 2880*365, verified, removeUnsealed)
 		if err != nil {
 			return err
 		}

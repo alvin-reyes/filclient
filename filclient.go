@@ -3,6 +3,7 @@ package filclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,13 +36,13 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/builtin"
-	"github.com/filecoin-project/go-state-types/builtin/v8/market"
 	"github.com/filecoin-project/go-state-types/builtin/v8/paych"
+	"github.com/filecoin-project/go-state-types/builtin/v9/market"
 	"github.com/filecoin-project/lotus/api"
 	rpcstmgr "github.com/filecoin-project/lotus/chain/stmgr/rpc"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/wallet"
-	paychmgr "github.com/filecoin-project/lotus/paychmgr"
+	"github.com/filecoin-project/lotus/paychmgr"
 	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
@@ -50,21 +51,21 @@ import (
 	gsimpl "github.com/ipfs/go-graphsync/impl"
 	gsnet "github.com/ipfs/go-graphsync/network"
 	"github.com/ipfs/go-graphsync/peerstate"
-	storeutil "github.com/ipfs/go-graphsync/storeutil"
+	"github.com/ipfs/go-graphsync/storeutil"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	logging "github.com/ipfs/go-log/v2"
-	car "github.com/ipld/go-car"
-	"github.com/libp2p/go-libp2p-core/host"
-	inet "github.com/libp2p/go-libp2p-core/network"
-	"github.com/libp2p/go-libp2p-core/peer"
-	"github.com/libp2p/go-libp2p-core/protocol"
+	"github.com/ipld/go-car"
+	"github.com/libp2p/go-libp2p/core/host"
+	inet "github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/multiformats/go-multiaddr"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
-var Tracer trace.Tracer = otel.Tracer("filclient")
+var Tracer = otel.Tracer("filclient")
 
 var log = logging.Logger("filclient")
 var retrievalLogger = logging.Logger("filclient-retrieval")
@@ -169,6 +170,7 @@ func NewClient(h host.Host, api api.Gateway, w *wallet.LocalWallet, addr address
 				// of a transfer, or there is a request for the same payload
 				// soon after
 				BlockInfoCacheManager: boostcar.NewDelayedUnrefBICM(time.Minute),
+				ThrottleLimit:         uint(100),
 			},
 			// Wait up to 24 hours for the transfer to complete (including
 			// after a connection bounce) before erroring out the deal
@@ -301,6 +303,10 @@ func NewClientWithConfig(cfg *Config) (*FilClient, error) {
 	retrievalEventPublisher.Subscribe(fc)
 
 	return fc, nil
+}
+
+func (fc *FilClient) GetDtMgr() datatransfer.Manager {
+	return fc.dataTransfer
 }
 
 func (fc *FilClient) SetPieceCommFunc(pcf GetPieceCommFunc) {
@@ -493,7 +499,7 @@ func ComputePrice(askPrice types.BigInt, size abi.PaddedPieceSize, duration abi.
 	return (*abi.TokenAmount)(&cost), nil
 }
 
-func (fc *FilClient) MakeDeal(ctx context.Context, miner address.Address, data cid.Cid, price types.BigInt, minSize abi.PaddedPieceSize, duration abi.ChainEpoch, verified bool) (*network.Proposal, error) {
+func (fc *FilClient) MakeDeal(ctx context.Context, miner address.Address, data cid.Cid, price types.BigInt, minSize abi.PaddedPieceSize, duration abi.ChainEpoch, verified bool, removeUnsealed bool) (*network.Proposal, error) {
 	ctx, span := Tracer.Start(ctx, "makeDeal", trace.WithAttributes(
 		attribute.Stringer("miner", miner),
 		attribute.Stringer("price", price),
@@ -581,7 +587,7 @@ func (fc *FilClient) MakeDeal(ctx context.Context, miner address.Address, data c
 			Root:         data,
 			RawBlockSize: dataSize,
 		},
-		FastRetrieval: true,
+		FastRetrieval: !removeUnsealed,
 	}, nil
 }
 
@@ -660,6 +666,7 @@ func (fc *FilClient) SendProposalV120(ctx context.Context, dbid uint, netprop ne
 			Params:   transferParams,
 			Size:     netprop.Piece.RawBlockSize,
 		},
+		RemoveUnsealedCopy: !netprop.FastRetrieval,
 	}
 
 	var resp smtypes.DealResponse
@@ -1520,7 +1527,47 @@ func (fc *FilClient) RetrieveContentFromPeerWithProgressCallback(
 	proposal *retrievalmarket.DealProposal,
 	progressCallback func(bytesReceived uint64),
 ) (*RetrievalStats, error) {
+	return fc.retrieveContentFromPeerWithProgressCallback(ctx, peerID, minerWallet, proposal, progressCallback, nil)
+}
 
+type RetrievalResult struct {
+	*RetrievalStats
+	Err error
+}
+
+func (fc *FilClient) RetrieveContentFromPeerAsync(
+	ctx context.Context,
+	peerID peer.ID,
+	minerWallet address.Address,
+	proposal *retrievalmarket.DealProposal,
+) (result <-chan RetrievalResult, onProgress <-chan uint64, gracefulShutdown func()) {
+	gracefulShutdownChan := make(chan struct{}, 1)
+	resultChan := make(chan RetrievalResult, 1)
+	progressChan := make(chan uint64)
+	internalCtx, internalCancel := context.WithCancel(ctx)
+	go func() {
+		defer internalCancel()
+		result, err := fc.retrieveContentFromPeerWithProgressCallback(internalCtx, peerID, minerWallet, proposal, func(bytes uint64) {
+			select {
+			case <-internalCtx.Done():
+			case progressChan <- bytes:
+			}
+		}, gracefulShutdownChan)
+		resultChan <- RetrievalResult{result, err}
+	}()
+	return resultChan, progressChan, func() {
+		gracefulShutdownChan <- struct{}{}
+	}
+}
+
+func (fc *FilClient) retrieveContentFromPeerWithProgressCallback(
+	ctx context.Context,
+	peerID peer.ID,
+	minerWallet address.Address,
+	proposal *retrievalmarket.DealProposal,
+	progressCallback func(bytesReceived uint64),
+	gracefulShutdownRequested <-chan struct{},
+) (*RetrievalStats, error) {
 	if progressCallback == nil {
 		progressCallback = func(bytesReceived uint64) {}
 	}
@@ -1760,34 +1807,58 @@ func (fc *FilClient) RetrieveContentFromPeerWithProgressCallback(
 	defer fc.dataTransfer.CloseDataTransferChannel(ctx, chanid)
 
 	// Wait for the retrieval to finish before exiting the function
-	select {
-	case err := <-dtRes:
-		if err != nil {
-			// If there is an error, publish a retrieval event failure
-			fc.retrievalEventPublisher.Publish(
-				rep.NewRetrievalEventFailure(rep.RetrievalPhase, rootCid, peerID, address.Undef,
-					fmt.Sprintf("data transfer failed: %s", err.Error())))
-			return nil, fmt.Errorf("data transfer failed: %w", err)
+awaitfinished:
+	for {
+		select {
+		case err := <-dtRes:
+			if err != nil {
+				// If there is an error, publish a retrieval event failure
+				fc.retrievalEventPublisher.Publish(
+					rep.NewRetrievalEventFailure(rep.RetrievalPhase, rootCid, peerID, address.Undef,
+						fmt.Sprintf("data transfer failed: %s", err.Error())))
+				return nil, fmt.Errorf("data transfer failed: %w", err)
+			}
+
+			log.Debugf("data transfer for retrieval complete")
+			break awaitfinished
+		case <-gracefulShutdownRequested:
+			go func() {
+				fc.dataTransfer.CloseDataTransferChannel(ctx, chanid)
+			}()
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
+	}
 
-		log.Debugf("data transfer for retrieval complete")
-
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	// Confirm that we actually ended up with the root block we wanted, failure
+	// here indicates a data transfer error that was not properly reported
+	if has, err := fc.blockstore.Has(ctx, rootCid); err != nil {
+		err = fmt.Errorf("could not get query blockstore: %w", err)
+		fc.retrievalEventPublisher.Publish(
+			rep.NewRetrievalEventFailure(rep.RetrievalPhase, rootCid, peerID, address.Undef, err.Error()))
+		return nil, err
+	} else if !has {
+		msg := "data transfer failed: unconfirmed block transfer"
+		fc.retrievalEventPublisher.Publish(
+			rep.NewRetrievalEventFailure(rep.RetrievalPhase, rootCid, peerID, address.Undef, msg))
+		return nil, errors.New(msg)
 	}
 
 	// Compile the retrieval stats
 
 	state, err := fc.dataTransfer.ChannelState(ctx, chanid)
 	if err != nil {
-		return nil, fmt.Errorf("could not get channel state: %w", err)
+		err = fmt.Errorf("could not get channel state: %w", err)
+		fc.retrievalEventPublisher.Publish(
+			rep.NewRetrievalEventFailure(rep.RetrievalPhase, rootCid, peerID, address.Undef, err.Error()))
+		return nil, err
 	}
 
 	duration := time.Since(startTime)
 	speed := uint64(float64(state.Received()) / duration.Seconds())
 
 	// Otherwise publish a retrieval event success
-	fc.retrievalEventPublisher.Publish(rep.NewRetrievalEventSuccess(rep.RetrievalPhase, rootCid, peerID, address.Undef, state.Received(), state.ReceivedCidsTotal()))
+	fc.retrievalEventPublisher.Publish(rep.NewRetrievalEventSuccess(rep.RetrievalPhase, rootCid, peerID, address.Undef, state.Received(), state.ReceivedCidsTotal(), duration, totalPayment))
 
 	return &RetrievalStats{
 		Peer:         state.OtherPeer(),

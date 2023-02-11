@@ -11,7 +11,7 @@ import (
 
 	"github.com/application-research/filclient"
 	"github.com/application-research/filclient/keystore"
-	"github.com/filecoin-project/go-state-types/builtin/v8/market"
+	"github.com/filecoin-project/go-state-types/builtin/v9/market"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/wallet"
 	lcli "github.com/filecoin-project/lotus/cli"
@@ -23,11 +23,11 @@ import (
 	levelds "github.com/ipfs/go-ds-leveldb"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p-core/crypto"
-	"github.com/libp2p/go-libp2p-core/host"
-	metrics "github.com/libp2p/go-libp2p-core/metrics"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
-	cli "github.com/urfave/cli/v2"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/metrics"
+	"github.com/urfave/cli/v2"
 )
 
 type dealData struct {
@@ -190,7 +190,7 @@ func setup(ctx context.Context, cfgdir string) (*Node, error) {
 		Blockstore: bstore,
 		DHT:        dht,
 		Datastore:  ds,
-		Bitswap:    bswap.(*bitswap.Bitswap),
+		Bitswap:    bswap,
 		Wallet:     wallet,
 	}, nil
 }
